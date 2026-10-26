@@ -1,59 +1,76 @@
-using Carbon.Api.Data;
-using Carbon.Api.Messaging;
-using Carbon.Api.Middleware;
-using Carbon.Api.Modules.Purchases;
-using Carbon.Api.Modules.Batches;
-using Carbon.Api.Modules.Certificates;
-using Microsoft.EntityFrameworkCore;
+using Carbon.Purchases;
+using Carbon.Batches;
+using Carbon.Certificates;
+using Carbon.Identity;
+using Carbon.Shared;
+using Carbon.Shared.Auth;
+using Carbon.Shared.Http;
+using Carbon.Shared.Messaging;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.AspNetCore.HttpOverrides;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
+var config = builder.Configuration;
 
-builder.Services.AddControllers().AddJsonOptions(o => o.JsonSerializerOptions.PropertyNameCaseInsensitive = true);
+if (config.GetValue("Logging:Json", false))
+    builder.Logging.AddJsonConsole(o =>
+    {
+        o.IncludeScopes = true;
+        o.UseUtcTimestamp = true;
+    });
+
+builder.Services.AddControllers()
+    .AddJsonOptions(o => o.JsonSerializerOptions.PropertyNameCaseInsensitive = true)
+    .AddApplicationPart(typeof(IdentityModule).Assembly)
+    .AddApplicationPart(typeof(PurchasesModule).Assembly)
+    .AddApplicationPart(typeof(BatchesModule).Assembly)
+    .AddApplicationPart(typeof(CertificatesModule).Assembly);
 builder.Services.AddProblemDetails();
 builder.Services.AddOpenApi();
+builder.Services.AddCarbonAuthorization();
 
-var connectionString = builder.Configuration.GetConnectionString("Carbon")
-    ?? throw new InvalidOperationException("Connection string 'Carbon' is not configured.");
-builder.Services.AddDbContext<CarbonDbContext>(options => options.UseNpgsql(connectionString));
+builder.Services.AddIdentityModule(config);
+var messaging = builder.Services.AddMessaging(config);
+builder.Services.AddPurchasesModule(config, messaging);
+builder.Services.AddBatchesModule(config, messaging);
+builder.Services.AddCertificatesModule(config, messaging);
+messaging.Start();
 
-builder.Services.Configure<RabbitOptions>(builder.Configuration.GetSection("RabbitMq"));
-builder.Services.Configure<KafkaOptions>(builder.Configuration.GetSection("Kafka"));
-builder.Services.Configure<PurchaseOptions>(builder.Configuration.GetSection("Purchases"));
-builder.Services.AddSingleton<RabbitConnection>();
-builder.Services.AddSingleton<KafkaLog>();
-
-builder.Services.AddScoped<PurchaseService>();
-builder.Services.AddScoped<BatchesHandler>();
-builder.Services.AddScoped<CertificatesHandler>();
-builder.Services.AddScoped<PurchasesHandler>();
-
-builder.Services.AddHostedService<OutboxRelay>();
-builder.Services.AddHostedService(sp => new ModuleConsumer<BatchesHandler>(
-    sp.GetRequiredService<IServiceScopeFactory>(), sp.GetRequiredService<RabbitConnection>(),
-    new ConsumerSpec(Topology.BatchesQueue, [Topology.ReserveKey, Topology.ReleaseKey], Prefetch: 1),
-    sp.GetRequiredService<ILogger<ModuleConsumer<BatchesHandler>>>()));
-builder.Services.AddHostedService(sp => new ModuleConsumer<CertificatesHandler>(
-    sp.GetRequiredService<IServiceScopeFactory>(), sp.GetRequiredService<RabbitConnection>(),
-    new ConsumerSpec(Topology.CertificatesQueue, [Topology.HeldKey], Prefetch: 4),
-    sp.GetRequiredService<ILogger<ModuleConsumer<CertificatesHandler>>>()));
-builder.Services.AddHostedService(sp => new ModuleConsumer<PurchasesHandler>(
-    sp.GetRequiredService<IServiceScopeFactory>(), sp.GetRequiredService<RabbitConnection>(),
-    new ConsumerSpec(Topology.PurchasesQueue,
-        [Topology.HeldKey, Topology.ShortKey, Topology.IssuedKey, Topology.RejectedKey, Topology.ReleasedKey], Prefetch: 4),
-    sp.GetRequiredService<ILogger<ModuleConsumer<PurchasesHandler>>>()));
+if (config.GetValue("ForwardedHeaders:Enabled", false))
+    builder.Services.Configure<ForwardedHeadersOptions>(o =>
+    {
+        // Behind the nginx container the real client address arrives in X-Forwarded-For. Trusting every proxy is only safe
+        // when the API is reachable through the proxy alone; restrict KnownNetworks to the proxy's network in production.
+        o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+        o.KnownIPNetworks.Clear();
+        o.KnownProxies.Clear();
+    });
 
 var app = builder.Build();
 
-app.UseMiddleware<ExceptionHandler>();
-app.MapControllers();
-app.MapOpenApi();
-app.MapScalarApiReference();
-app.MapGet("/api/health", () => Results.Text("Healthy"));
+if (config.GetValue("ForwardedHeaders:Enabled", false))
+    app.UseForwardedHeaders();
+app.UseMiddleware<CorrelationIdMiddleware>();
+app.UseMiddleware<SecurityHeadersMiddleware>();
+app.UseMiddleware<ExceptionMiddleware>();
+app.UseStatusCodePages();
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
 
-using (var scope = app.Services.CreateScope())
+app.MapControllers();
+app.MapGet("/api/health", () => Results.Text("Healthy")).AllowAnonymous();
+app.MapHealthChecks("/api/health/ready", new HealthCheckOptions { Predicate = r => r.Tags.Contains("ready") }).AllowAnonymous();
+if (config.GetValue("Docs:Public", false))
 {
-    await scope.ServiceProvider.GetRequiredService<CarbonDbContext>().Database.MigrateAsync();
+    app.MapOpenApi().AllowAnonymous();
+    app.MapScalarApiReference().AllowAnonymous();
 }
 
+foreach (var migrator in app.Services.GetServices<IModuleMigrator>().OrderBy(m => m.Order))
+    await migrator.MigrateAsync(app.Services, CancellationToken.None);
+
 app.Run();
+
+public partial class Program;

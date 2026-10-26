@@ -15,6 +15,7 @@ export type PurchaseStatus = 'Requested' | 'Held' | 'Allocated' | 'Reversed' | '
 export interface Purchase {
   id: string;
   batchCode: string;
+  ownerId: string;
   reference: string;
   tonnes: number;
   totalCents: number;
@@ -31,4 +32,16 @@ export interface LogEntry {
   type: string;
   module: string;
   occurredAt: string;
+}
+
+export interface UserInfo {
+  id: string;
+  email: string;
+  roles: string[];
+}
+
+export interface AuthResponse {
+  accessToken: string;
+  expiresAt: string;
+  user: UserInfo;
 }
