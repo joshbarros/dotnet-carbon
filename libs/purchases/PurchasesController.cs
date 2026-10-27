@@ -19,10 +19,14 @@ public class PurchasesController(PurchaseService service, KafkaLog kafka) : Cont
         return Accepted($"/api/purchases/{purchase.Id}", PurchaseDto.From(purchase));
     }
 
-    /// <summary>Your purchases. Staff see everyone's.</summary>
+    /// <summary>Your purchases, newest first, a page at a time (default 100, at most 100). Staff see everyone's. The total is in X-Total-Count.</summary>
     [HttpGet]
-    public async Task<IEnumerable<PurchaseDto>> List([FromQuery] string? batchCode, CancellationToken ct) =>
-        (await service.ListAsync(batchCode, ct)).Select(PurchaseDto.From);
+    public async Task<IEnumerable<PurchaseDto>> List([FromQuery] string? batchCode, [FromQuery] int page = 1, [FromQuery] int pageSize = 100, CancellationToken ct = default)
+    {
+        var (items, total) = await service.ListAsync(batchCode, Math.Max(page, 1), Math.Clamp(pageSize, 1, 100), ct);
+        Response.Headers["X-Total-Count"] = total.ToString();
+        return items.Select(PurchaseDto.From);
+    }
 
     [HttpGet("{id:guid}")]
     public async Task<PurchaseDto> Get(Guid id, CancellationToken ct) => PurchaseDto.From(await service.GetAsync(id, ct));

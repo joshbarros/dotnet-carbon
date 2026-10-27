@@ -63,7 +63,7 @@ public class PurchaseService(PurchasesDbContext db, IBatchCatalog batches, ICurr
         return purchase;
     }
 
-    public async Task<List<Purchase>> ListAsync(string? batchCode, CancellationToken ct)
+    public async Task<(List<Purchase> Items, int Total)> ListAsync(string? batchCode, int page, int pageSize, CancellationToken ct)
     {
         var query = db.Purchases.AsNoTracking();
         if (!user.IsStaff)
@@ -73,7 +73,9 @@ public class PurchaseService(PurchasesDbContext db, IBatchCatalog batches, ICurr
         }
         if (!string.IsNullOrWhiteSpace(batchCode))
             query = query.Where(b => b.BatchCode == batchCode);
-        return await query.OrderByDescending(b => b.CreatedAt).Take(100).ToListAsync(ct);
+        var total = await query.CountAsync(ct);
+        var items = await query.OrderByDescending(b => b.CreatedAt).Skip((page - 1) * pageSize).Take(pageSize).ToListAsync(ct);
+        return (items, total);
     }
 
     /// <summary>Moves Held or Allocated to Reversed and asks Batches to give the tonnes back. The certificate is not touched.</summary>
